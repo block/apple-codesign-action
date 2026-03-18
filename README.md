@@ -1,31 +1,71 @@
-# apple-codesign-action README
+# Apple Code Signing Action
 
-Congrats, project leads! You got a new project to grow!
+Reusable GitHub Action for signing Apple applications via Block's internal codesigning service (`codesign_helper` Lambda + Buildkite).
 
-This stub is meant to help you form a strong community around your work. It's yours to adapt, and may 
-diverge from this initial structure. Just keep the files seeded in this repo, and the rest is yours to evolve! 
+## Setup
 
-## Introduction
+Reach out to **#mdx-ios** on Slack to get codesigning configured for your repo. They will provision the required infrastructure and set up two repository secrets:
 
-Orient users to the project here. This is a good place to start with an assumption
-that the user knows very little - so start with the Big Picture and show how this
-project fits into it.
+| Secret | Description |
+|---|---|
+| `OSX_CODESIGN_ROLE` | IAM role ARN for OIDC authentication with AWS |
+| `CODESIGN_S3_BUCKET` | S3 bucket for artifact transfer |
 
-Then maybe a dive into what this project does.
+## Usage
 
-Diagrams and other visuals are helpful here. Perhaps code snippets showing usage.
+The calling job must have `id-token: write` permission for OIDC authentication with AWS.
 
-Project leads should complete, alongside this `README`:
+```yaml
+# Example workflow — replace the build and release steps with your own
+name: Build and Release
+on:
+  push:
+    tags: ['v*']
 
-* [CODEOWNERS](./CODEOWNERS) - set project lead(s)
-* [CONTRIBUTING.md](./CONTRIBUTING.md) - Fill out how to: install prereqs, build, test, run, access CI, chat, discuss, file issues
-* [Bug-report.md](.github/ISSUE_TEMPLATE/bug-report.md) - Fill out `Assignees` add codeowners @names
-* [config.yml](.github/ISSUE_TEMPLATE/config.yml) - remove "(/add your discord channel..)" and replace the url with your Discord channel if applicable
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+      id-token: write # Required — the action uses OIDC to authenticate with AWS
+    steps:
+      # ...
+      # Your build step — produces an unsigned .app or .zip
+      # ...
 
-The other files in this template repo may be used as-is:
+      # apple-codesign-action — signs and notarizes the artifact
+      - name: Codesign and Notarize
+        id: codesign
+        uses: block/apple-codesign-action@XXX # use the latest version ref
+        with:
+          osx-codesign-role: ${{ secrets.OSX_CODESIGN_ROLE }}
+          codesign-s3-bucket: ${{ secrets.CODESIGN_S3_BUCKET }}
+          unsigned-artifact-path: <path-to-unsigned-artifact> # .app or .zip containing a .app
+          entitlements-plist-path: <path-to-entitlements>     # Optional
 
-* [GOVERNANCE.md](./GOVERNANCE.md)
-* [LICENSE](./LICENSE)
+      # Use the signed artifact in subsequent steps
+      # steps.codesign.outputs.signed-artifact-path
+      # ...
+```
+
+## Inputs
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `osx-codesign-role` | **yes** | — | `${{ secrets.OSX_CODESIGN_ROLE }}` |
+| `codesign-s3-bucket` | **yes** | — | `${{ secrets.CODESIGN_S3_BUCKET }}` |
+| `unsigned-artifact-path` | **yes** | — | Local path to unsigned artifact (`.app` or `.zip` containing a `.app`) |
+| `entitlements-plist-path` | no | `''` | Path to entitlements plist to bundle into the signing payload |
+| `artifact-name` | no | `$GITHUB_SHA-$GITHUB_RUN_ID` | Unique S3 key suffix |
+| `branch` | no | `main` | Branch override for the signing pipeline (only honored for approved repos) |
+
+## Outputs
+
+| Output | Description |
+|---|---|
+| `signed-artifact-path` | Local path to the downloaded signed artifact |
+| `build-number` | Build number from the signing service |
+| `signing-duration` | Wall-clock seconds the signing took |
 
 ## Project Resources
 
@@ -33,4 +73,4 @@ The other files in this template repo may be used as-is:
 | ------------------------------------------ | ------------------------------------------------------------------------------ |
 | [CODEOWNERS](./CODEOWNERS)                 | Outlines the project lead(s)                                                   |
 | [GOVERNANCE.md](./GOVERNANCE.md)           | Project governance                                                             |
-| [LICENSE](./LICENSE)                       | Apache License, Version 2.0                                                    |
+| [LICENSE](./LICENSE)                        | Apache License, Version 2.0                                                    |

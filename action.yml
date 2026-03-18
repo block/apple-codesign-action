@@ -1,0 +1,242 @@
+name: 'Apple Code Signing'
+description: 'Sign Apple applications via Block codesigning service (Lambda + Buildkite)'
+author: 'Block, Inc.'
+
+inputs:
+  osx-codesign-role:
+    description: 'IAM role ARN for OIDC authentication with AWS'
+    required: true
+  codesign-s3-bucket:
+    description: 'S3 bucket for artifact transfer'
+    required: true
+  unsigned-artifact-path:
+    description: 'Local path to the unsigned artifact (.app or .zip containing a .app)'
+    required: true
+  entitlements-plist-path:
+    description: 'Path to entitlements.plist to bundle into the signing payload'
+    required: false
+    default: ''
+  artifact-name:
+    description: 'Unique identifier for the S3 key (default: $GITHUB_SHA-$GITHUB_RUN_ID)'
+    required: false
+    default: ''
+  branch:
+    description: 'Branch override for the signing pipeline (only allowed for approved repos)'
+    required: false
+    default: 'main'
+
+outputs:
+  signed-artifact-path:
+    description: 'Local path to the downloaded signed artifact'
+    value: ${{ steps.download.outputs.signed-artifact-path }}
+  build-number:
+    description: 'Build number from the signing service'
+    value: ${{ steps.invoke.outputs.build-number }}
+  signing-duration:
+    description: 'Wall-clock seconds the signing took'
+    value: ${{ steps.poll.outputs.duration }}
+
+runs:
+  using: 'composite'
+  steps:
+    # Step 0: Configure AWS credentials via OIDC
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.osx-codesign-role }}
+        aws-region: us-west-2
+
+    # Step 1: Upload unsigned artifact to S3
+    - name: Upload unsigned artifact
+      id: upload
+      shell: bash
+      env:
+        UNSIGNED_PATH: ${{ inputs.unsigned-artifact-path }}
+        ENTITLEMENTS_PATH: ${{ inputs.entitlements-plist-path }}
+        S3_BUCKET: ${{ inputs.codesign-s3-bucket }}
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+      run: |
+        set -euo pipefail
+
+        # Default artifact name if not provided
+        artifact_name="${ARTIFACT_NAME:-${GITHUB_SHA}-${GITHUB_RUN_ID}}"
+
+        if [[ ! -f "${UNSIGNED_PATH}" ]]; then
+          echo "::error::Unsigned artifact not found: ${UNSIGNED_PATH}"
+          exit 1
+        fi
+
+        basename="$(basename "${UNSIGNED_PATH}")"
+        upload_path="${UNSIGNED_PATH}"
+
+        # If the artifact is not already a zip, create one
+        if [[ "${basename}" != *.zip ]]; then
+          echo "::group::Creating zip archive"
+          zip_path="${RUNNER_TEMP}/${basename}.zip"
+          # Use ditto on macOS for proper resource fork handling
+          if command -v ditto &>/dev/null; then
+            ditto -c -k --keepParent "${UNSIGNED_PATH}" "${zip_path}"
+          else
+            (cd "$(dirname "${UNSIGNED_PATH}")" && zip -r "${zip_path}" "${basename}")
+          fi
+          upload_path="${zip_path}"
+          basename="${basename}.zip"
+          echo "::endgroup::"
+        fi
+
+        # Bundle entitlements plist if provided
+        if [[ -n "${ENTITLEMENTS_PATH}" ]]; then
+          if [[ ! -f "${ENTITLEMENTS_PATH}" ]]; then
+            echo "::error::Entitlements plist not found: ${ENTITLEMENTS_PATH}"
+            exit 1
+          fi
+          echo "::group::Bundling entitlements plist"
+          # If we haven't already copied to RUNNER_TEMP, do so now
+          if [[ "${upload_path}" == "${UNSIGNED_PATH}" ]]; then
+            cp "${upload_path}" "${RUNNER_TEMP}/${basename}"
+            upload_path="${RUNNER_TEMP}/${basename}"
+          fi
+          zip -u -j "${upload_path}" "${ENTITLEMENTS_PATH}"
+          echo "::endgroup::"
+        fi
+
+        s3_key="unsigned/${artifact_name}-${basename}"
+        s3_url="s3://${S3_BUCKET}/${s3_key}"
+
+        echo "Uploading to ${s3_url}"
+        aws s3 cp --quiet "${upload_path}" "${s3_url}"
+
+        echo "s3-url=${s3_url}" >> "${GITHUB_OUTPUT}"
+        echo "artifact-basename=${basename}" >> "${GITHUB_OUTPUT}"
+
+    # Step 2: Invoke Lambda to initiate signing
+    - name: Invoke signing service
+      id: invoke
+      shell: bash
+      env:
+        S3_URL: ${{ steps.upload.outputs.s3-url }}
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        set -euo pipefail
+
+        source_job_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+        payload=$(jq -n \
+          --arg s3_url "${S3_URL}" \
+          --arg job_url "${source_job_url}" \
+          --arg repo "${GITHUB_REPOSITORY}" \
+          --arg branch "${BRANCH}" \
+          '{source_s3_url: $s3_url, source_job_url: $job_url, repo: $repo, branch: $branch}')
+
+        response_file="${RUNNER_TEMP}/lambda-invoke-response.json"
+
+        echo "Invoking Lambda function: codesign_helper"
+        aws lambda invoke \
+          --function-name codesign_helper \
+          --payload "${payload}" \
+          --cli-binary-format raw-in-base64-out \
+          "${response_file}"
+
+        echo "::group::Lambda response"
+        cat "${response_file}"
+        echo ""
+        echo "::endgroup::"
+
+        status_code=$(jq -r '.statusCode' "${response_file}")
+        if [[ "${status_code}" != "200" ]]; then
+          echo "::error::Lambda invocation failed with status ${status_code}"
+          jq -r '.body // .' "${response_file}" >&2
+          exit 1
+        fi
+
+        build_number=$(jq -r '.body.build_number' "${response_file}")
+        if [[ -z "${build_number}" || "${build_number}" == "null" ]]; then
+          echo "::error::No build_number in Lambda response"
+          exit 1
+        fi
+
+        echo "Signing initiated — build number: ${build_number}"
+        echo "build-number=${build_number}" >> "${GITHUB_OUTPUT}"
+
+    # Step 3: Poll for completion
+    - name: Poll signing status
+      id: poll
+      shell: bash
+      env:
+        S3_URL: ${{ steps.upload.outputs.s3-url }}
+        BUILD_NUMBER: ${{ steps.invoke.outputs.build-number }}
+      run: |
+        set -euo pipefail
+
+        poll_interval=30
+        timeout=3600
+        start_time=$(date +%s)
+        response_file="${RUNNER_TEMP}/lambda-poll-response.json"
+
+        payload=$(jq -n \
+          --arg s3_url "${S3_URL}" \
+          --arg build "${BUILD_NUMBER}" \
+          '{source_s3_url: $s3_url, build_number: $build}')
+
+        while true; do
+          now=$(date +%s)
+          elapsed=$(( now - start_time ))
+          if (( elapsed >= timeout )); then
+            echo "::error::Signing timed out after ${timeout}s"
+            exit 1
+          fi
+
+          aws lambda invoke \
+            --function-name codesign_helper \
+            --payload "${payload}" \
+            --cli-binary-format raw-in-base64-out \
+            "${response_file}" > /dev/null
+
+          status_code=$(jq -r '.statusCode' "${response_file}")
+          if [[ "${status_code}" != "200" ]]; then
+            echo "::error::Poll request failed with status ${status_code}"
+            jq -r '.body // .' "${response_file}" >&2
+            exit 1
+          fi
+
+          state=$(jq -r '.body.state' "${response_file}")
+
+          case "${state}" in
+            completed)
+              duration=$(( $(date +%s) - start_time ))
+              destination_url=$(jq -r '.body.destination_url' "${response_file}")
+              echo "Signing completed in ${duration}s"
+              echo "duration=${duration}" >> "${GITHUB_OUTPUT}"
+              echo "destination-url=${destination_url}" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+            failed|error)
+              echo "::error::Signing failed with state: ${state}"
+              jq '.' "${response_file}" >&2
+              exit 1
+              ;;
+            *)
+              echo "Status: ${state} (${elapsed}s elapsed, timeout: ${timeout}s)"
+              ;;
+          esac
+
+          sleep "${poll_interval}"
+        done
+
+    # Step 4: Download signed artifact
+    - name: Download signed artifact
+      id: download
+      shell: bash
+      env:
+        DESTINATION_URL: ${{ steps.poll.outputs.destination-url }}
+        ARTIFACT_BASENAME: ${{ steps.upload.outputs.artifact-basename }}
+      run: |
+        set -euo pipefail
+
+        signed_path="${RUNNER_TEMP}/signed-${ARTIFACT_BASENAME}"
+
+        echo "Downloading signed artifact"
+        aws s3 cp --quiet "${DESTINATION_URL}" "${signed_path}"
+
+        echo "Signed artifact saved to: ${signed_path}"
+        echo "signed-artifact-path=${signed_path}" >> "${GITHUB_OUTPUT}"

@@ -1,0 +1,39 @@
+{
+  "invoke_success": {
+    "statusCode": "200",
+    "body": {
+      "build_number": "12345",
+      "state": "scheduled"
+    }
+  },
+  "invoke_error": {
+    "statusCode": "500",
+    "body": "Internal server error"
+  },
+  "poll_in_progress": {
+    "statusCode": "200",
+    "body": {
+      "build_number": "12345",
+      "state": "running"
+    }
+  },
+  "poll_completed": {
+    "statusCode": "200",
+    "body": {
+      "build_number": "12345",
+      "state": "completed",
+      "destination_url": "s3://test-bucket/signed/test-artifact.zip"
+    }
+  },
+  "poll_failed": {
+    "statusCode": "200",
+    "body": {
+      "build_number": "12345",
+      "state": "failed"
+    }
+  },
+  "poll_error_status": {
+    "statusCode": "500",
+    "body": "Lambda execution error"
+  }
+}
