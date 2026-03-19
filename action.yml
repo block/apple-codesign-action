@@ -41,7 +41,7 @@ runs:
   steps:
     # Step 0: Configure AWS credentials via OIDC
     - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
+      uses: aws-actions/configure-aws-credentials@v6
       with:
         role-to-assume: ${{ inputs.osx-codesign-role }}
         aws-region: us-west-2
