@@ -61,7 +61,7 @@ runs:
         # Default artifact name if not provided
         artifact_name="${ARTIFACT_NAME:-${GITHUB_SHA}-${GITHUB_RUN_ID}}"
 
-        if [[ ! -f "${UNSIGNED_PATH}" ]]; then
+        if [[ ! -e "${UNSIGNED_PATH}" ]]; then
           echo "::error::Unsigned artifact not found: ${UNSIGNED_PATH}"
           exit 1
         fi

@@ -78,13 +78,78 @@ get_output() {
 
   run bash -c 'set -euo pipefail
     artifact_name="${ARTIFACT_NAME:-${GITHUB_SHA}-${GITHUB_RUN_ID}}"
-    if [[ ! -f "${UNSIGNED_PATH}" ]]; then
+    if [[ ! -e "${UNSIGNED_PATH}" ]]; then
       echo "::error::Unsigned artifact not found: ${UNSIGNED_PATH}"
       exit 1
     fi'
 
   [ "$status" -eq 1 ]
   [[ "$output" == *"Unsigned artifact not found"* ]]
+}
+
+@test "upload: accepts .app directory artifact" {
+  # .app bundles are directories, not files — ensure the existence check handles this
+  local app_dir="${BATS_TEST_TMPDIR}/TestApp.app"
+  mkdir -p "${app_dir}/Contents/MacOS"
+  echo "binary" > "${app_dir}/Contents/MacOS/TestApp"
+  cat > "${app_dir}/Contents/Info.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.test</string>
+</dict></plist>
+PLIST
+
+  export UNSIGNED_PATH="${app_dir}"
+  export ENTITLEMENTS_PATH=""
+  export S3_BUCKET="test-bucket"
+  export ARTIFACT_NAME="app-artifact"
+
+  # Mock aws and ditto
+  cat > "${MOCK_BIN}/aws" << 'SCRIPT'
+#!/bin/bash
+if [[ "$1" == "s3" && "$2" == "cp" ]]; then
+  echo "s3-cp: $3 -> $4" >> "${BATS_TEST_TMPDIR}/aws_calls.log"
+  exit 0
+fi
+exit 1
+SCRIPT
+  chmod +x "${MOCK_BIN}/aws"
+
+  cat > "${MOCK_BIN}/ditto" << 'SCRIPT'
+#!/bin/bash
+# Mock ditto — just create the output file
+touch "$4"
+exit 0
+SCRIPT
+  chmod +x "${MOCK_BIN}/ditto"
+
+  run bash -c '
+    set -euo pipefail
+    artifact_name="${ARTIFACT_NAME:-${GITHUB_SHA}-${GITHUB_RUN_ID}}"
+    if [[ ! -e "${UNSIGNED_PATH}" ]]; then
+      echo "::error::Unsigned artifact not found: ${UNSIGNED_PATH}"
+      exit 1
+    fi
+    basename="$(basename "${UNSIGNED_PATH}")"
+    upload_path="${UNSIGNED_PATH}"
+    if [[ "${basename}" != *.zip ]]; then
+      zip_path="${RUNNER_TEMP}/${basename}.zip"
+      if command -v ditto &>/dev/null; then
+        ditto -c -k --keepParent "${UNSIGNED_PATH}" "${zip_path}"
+      else
+        (cd "$(dirname "${UNSIGNED_PATH}")" && zip -r "${zip_path}" "${basename}")
+      fi
+      upload_path="${zip_path}"
+      basename="${basename}.zip"
+    fi
+    s3_key="unsigned/${artifact_name}-${basename}"
+    s3_url="s3://${S3_BUCKET}/${s3_key}"
+    aws s3 cp --quiet "${upload_path}" "${s3_url}"
+    echo "s3-url=${s3_url}" >> "${GITHUB_OUTPUT}"
+  '
+
+  [ "$status" -eq 0 ]
+  [[ "$(get_output 's3-url')" == "s3://test-bucket/unsigned/app-artifact-TestApp.app.zip" ]]
 }
 
 @test "upload: uploads zip artifact directly" {
@@ -109,7 +174,7 @@ SCRIPT
   run bash -c '
     set -euo pipefail
     artifact_name="${ARTIFACT_NAME:-${GITHUB_SHA}-${GITHUB_RUN_ID}}"
-    if [[ ! -f "${UNSIGNED_PATH}" ]]; then
+    if [[ ! -e "${UNSIGNED_PATH}" ]]; then
       echo "::error::Unsigned artifact not found: ${UNSIGNED_PATH}"
       exit 1
     fi
@@ -136,7 +201,7 @@ SCRIPT
 
   run bash -c '
     set -euo pipefail
-    if [[ ! -f "${UNSIGNED_PATH}" ]]; then
+    if [[ ! -e "${UNSIGNED_PATH}" ]]; then
       echo "::error::Unsigned artifact not found: ${UNSIGNED_PATH}"
       exit 1
     fi
