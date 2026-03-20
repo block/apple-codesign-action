@@ -10,7 +10,7 @@ inputs:
     description: 'S3 bucket for artifact transfer'
     required: true
   unsigned-artifact-path:
-    description: 'Local path to the unsigned artifact (.app or .zip containing a .app)'
+    description: 'Local path to the unsigned artifact (.app, .zip containing a .app, or .dmg containing a .app)'
     required: true
   entitlements-plist-path:
     description: 'Path to entitlements.plist to bundle into the signing payload'
@@ -27,8 +27,11 @@ inputs:
 
 outputs:
   signed-artifact-path:
-    description: 'Local path to the downloaded signed artifact'
+    description: 'Local path to the downloaded signed artifact (.app inside a .zip)'
     value: ${{ steps.download.outputs.signed-artifact-path }}
+  signed-dmg-path:
+    description: 'Local path to the DMG with signed .app swapped in (only set when input was a .dmg)'
+    value: ${{ steps.rebuild-dmg.outputs.signed-dmg-path }}
   build-number:
     description: 'Build number from the signing service'
     value: ${{ steps.invoke.outputs.build-number }}
@@ -68,10 +71,30 @@ runs:
 
         basename="$(basename "${UNSIGNED_PATH}")"
         upload_path="${UNSIGNED_PATH}"
+        input_type="zip"
 
+        # Handle DMG: extract the .app, zip it for the signing service
+        if [[ "${basename}" == *.dmg ]]; then
+          echo "::group::Extracting .app from DMG"
+          input_type="dmg"
+          mount_point=$(hdiutil attach "${UNSIGNED_PATH}" -nobrowse -readonly | grep -o '/Volumes/.*')
+          app_path=$(find "${mount_point}" -maxdepth 1 -name "*.app" -print -quit)
+          if [[ -z "${app_path}" ]]; then
+            hdiutil detach "${mount_point}" 2>/dev/null || true
+            echo "::error::No .app found in DMG: ${UNSIGNED_PATH}"
+            exit 1
+          fi
+          app_name="$(basename "${app_path}")"
+          zip_path="${RUNNER_TEMP}/${app_name}.zip"
+          ditto -c -k --keepParent "${app_path}" "${zip_path}"
+          hdiutil detach "${mount_point}"
+          upload_path="${zip_path}"
+          basename="${app_name}.zip"
+          echo "::endgroup::"
         # If the artifact is not already a zip, create one
-        if [[ "${basename}" != *.zip ]]; then
+        elif [[ "${basename}" != *.zip ]]; then
           echo "::group::Creating zip archive"
+          input_type="app"
           zip_path="${RUNNER_TEMP}/${basename}.zip"
           # Use ditto on macOS for proper resource fork handling
           if command -v ditto &>/dev/null; then
@@ -108,6 +131,8 @@ runs:
 
         echo "s3-url=${s3_url}" >> "${GITHUB_OUTPUT}"
         echo "artifact-basename=${basename}" >> "${GITHUB_OUTPUT}"
+        echo "input-type=${input_type}" >> "${GITHUB_OUTPUT}"
+        echo "dmg-path=${UNSIGNED_PATH}" >> "${GITHUB_OUTPUT}"
 
     # Step 2: Invoke Lambda to initiate signing
     - name: Invoke signing service
@@ -240,3 +265,40 @@ runs:
 
         echo "Signed artifact saved to: ${signed_path}"
         echo "signed-artifact-path=${signed_path}" >> "${GITHUB_OUTPUT}"
+
+    # Step 5: Rebuild DMG with signed .app (only when input was a .dmg)
+    - name: Rebuild DMG with signed app
+      id: rebuild-dmg
+      if: steps.upload.outputs.input-type == 'dmg'
+      shell: bash
+      env:
+        SIGNED_ZIP: ${{ steps.download.outputs.signed-artifact-path }}
+        ORIGINAL_DMG: ${{ steps.upload.outputs.dmg-path }}
+      run: |
+        set -euo pipefail
+
+        # Extract signed .app from the zip
+        extract_dir="${RUNNER_TEMP}/signed-app-extract"
+        mkdir -p "${extract_dir}"
+        ditto -x -k "${SIGNED_ZIP}" "${extract_dir}"
+        signed_app=$(find "${extract_dir}" -maxdepth 1 -name "*.app" -print -quit)
+        if [[ -z "${signed_app}" ]]; then
+          echo "::error::No .app found in signed artifact"
+          exit 1
+        fi
+
+        # Convert DMG to read-write, swap the .app, convert back
+        rw_dmg="${RUNNER_TEMP}/rw-$(basename "${ORIGINAL_DMG}")"
+        hdiutil convert "${ORIGINAL_DMG}" -format UDRW -o "${rw_dmg}"
+
+        mount_point=$(hdiutil attach "${rw_dmg}" -nobrowse | grep -o '/Volumes/.*')
+        old_app=$(find "${mount_point}" -maxdepth 1 -name "*.app" -print -quit)
+        rm -rf "${old_app}"
+        cp -R "${signed_app}" "${mount_point}/$(basename "${signed_app}")"
+        hdiutil detach "${mount_point}"
+
+        signed_dmg="${RUNNER_TEMP}/signed-$(basename "${ORIGINAL_DMG}")"
+        hdiutil convert "${rw_dmg}" -format UDZO -o "${signed_dmg}"
+
+        echo "Signed DMG saved to: ${signed_dmg}"
+        echo "signed-dmg-path=${signed_dmg}" >> "${GITHUB_OUTPUT}"

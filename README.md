@@ -34,19 +34,23 @@ jobs:
       # ...
 
       # apple-codesign-action — signs and notarizes the artifact
+      # Sign a .app or .zip
       - name: Codesign and Notarize
         id: codesign
         uses: block/apple-codesign-action@XXX # use the latest version ref
         with:
           osx-codesign-role: ${{ secrets.OSX_CODESIGN_ROLE }}
           codesign-s3-bucket: ${{ secrets.CODESIGN_S3_BUCKET }}
-          unsigned-artifact-path: <path-to-unsigned-artifact> # .app or .zip containing a .app
+          unsigned-artifact-path: <path-to-unsigned-artifact> # .app, .zip, or .dmg
           entitlements-plist-path: <path-to-entitlements>     # Optional
 
       # Use the signed artifact in subsequent steps
-      # steps.codesign.outputs.signed-artifact-path
+      # steps.codesign.outputs.signed-artifact-path  — signed .app (always set)
+      # steps.codesign.outputs.signed-dmg-path       — signed DMG (only when input was .dmg)
       # ...
 ```
+
+See [apple-codesign-action-example](https://github.com/block/apple-codesign-action-example) for runnable end-to-end examples (`.app`, `.zip`, `.dmg`, Electron, Xcode).
 
 ## Inputs
 
@@ -54,7 +58,7 @@ jobs:
 |---|---|---|---|
 | `osx-codesign-role` | **yes** | — | `${{ secrets.OSX_CODESIGN_ROLE }}` |
 | `codesign-s3-bucket` | **yes** | — | `${{ secrets.CODESIGN_S3_BUCKET }}` |
-| `unsigned-artifact-path` | **yes** | — | Local path to unsigned artifact (`.app` or `.zip` containing a `.app`) |
+| `unsigned-artifact-path` | **yes** | — | Local path to unsigned artifact (`.app`, `.zip` containing a `.app`, or `.dmg` containing a `.app`) |
 | `entitlements-plist-path` | no | `''` | Path to entitlements plist to bundle into the signing payload |
 | `artifact-name` | no | `$GITHUB_SHA-$GITHUB_RUN_ID` | Unique S3 key suffix |
 | `branch` | no | `main` | Branch override for the signing pipeline (only honored for approved repos) |
@@ -63,7 +67,8 @@ jobs:
 
 | Output | Description |
 |---|---|
-| `signed-artifact-path` | Local path to the downloaded signed artifact |
+| `signed-artifact-path` | Local path to the downloaded signed artifact (`.app` inside a `.zip`) |
+| `signed-dmg-path` | Local path to the DMG with signed `.app` swapped in (only set when input was a `.dmg`) |
 | `build-number` | Build number from the signing service |
 | `signing-duration` | Wall-clock seconds the signing took |
 
